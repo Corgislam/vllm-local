@@ -1,0 +1,5 @@
+local_cpu: True
+max_local_cpu_size: 5           # 本地 CPU buffer，单位 GB
+max_local_disk_size: 0
+remote_url: "lm://localhost:8500"  # LMCache Server 地址
+remote_serde: naive
