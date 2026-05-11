@@ -1,103 +1,145 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vllm-local — Triton kernel raw-pointer → block-pointer conversion
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+Local working fork tracking [vllm-project/vllm#40458][rfc] — an RFC to
+convert vLLM's core dense-inference Triton kernels from raw pointer
+arithmetic (`tl.load(ptr + offset, mask=...)`) to structured block
+pointers (`tl.make_block_ptr` / `tl.advance`).
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+[rfc]: https://github.com/vllm-project/vllm/issues/40458
 
-🔥 We have built a vllm website to help you get started with vllm. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+Original upstream README preserved at [`README.vllm.md`](./README.vllm.md).
 
----
+## Why
 
-## About
+Block pointers:
 
-vLLM is a fast and easy-to-use library for LLM inference and serving.
+1. **Enable hardware portability** — tiled-memory accelerators (Intel
+   XPU, IBM Spyre/AIU, etc.) cannot lower raw pointer arithmetic.
+2. **Leverage Hopper TMA** — block pointers can be lowered to Tensor
+   Memory Accelerator instructions on H100/H200.
+3. **Align with Triton's direction** — structured memory access is the
+   project's primary recommended API.
+4. **Improve readability** — memory layout (shape, strides, offsets) is
+   separated from computation (load, compute, store).
 
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has evolved into a community-driven project with contributions from both academia and industry.
+## Scope of this repo
 
-vLLM is fast with:
+Local bench and validation work for the five kernels listed in the RFC:
 
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests
-- Fast model execution with CUDA/HIP graph
-- Quantizations: [GPTQ](https://arxiv.org/abs/2210.17323), [AWQ](https://arxiv.org/abs/2306.00978), [AutoRound](https://arxiv.org/abs/2309.05516), INT4, INT8, and FP8
-- Optimized CUDA kernels, including integration with FlashAttention and FlashInfer
-- Speculative decoding
-- Chunked prefill
+| # | Kernel | File | Status |
+|---|--------|------|--------|
+| 1 | SwiGLU-Step (`_swiglustep_and_mul_kernel`) | `vllm/model_executor/layers/activation.py` | done on `feat/swiglu-blockptr` |
+| 2 | Ranks (`_ranks_kernel`) | `vllm/v1/worker/gpu/sample/logprob.py` | pending |
+| 3 | RMSNorm (`_rms_norm_kernel`) | `vllm/model_executor/layers/batch_invariant.py` | pending |
+| 4 | Log-softmax (`_topk_log_softmax_kernel`) | `vllm/v1/worker/gpu/sample/logprob.py` | pending |
+| 5 | MRoPE (`_triton_mrope_forward`) | `vllm/model_executor/layers/rotary_embedding/mrope.py` | pending |
 
-vLLM is flexible and easy to use with:
+Each conversion lives on its own branch (`feat/<kernel>-blockptr`) with
+a standalone plan, equivalence test, and benchmark script.
 
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data and expert parallelism support for distributed inference
-- Streaming outputs
-- OpenAI-compatible API server
-- Support for NVIDIA GPUs, AMD CPUs and GPUs, Intel CPUs and GPUs, PowerPC CPUs, Arm CPUs, and TPU. Additionally, support for diverse hardware plugins such as Intel Gaudi, IBM Spyre and Huawei Ascend.
-- Prefix caching support
-- Multi-LoRA support
+Nothing is merged back to `main` inside this repo; it stays as a
+collection of parallel feature branches, each a candidate for eventual
+upstream submission.
 
-vLLM seamlessly supports most popular open-source models on HuggingFace, including:
+## Branches
 
-- Transformer-like LLMs (e.g., Llama)
-- Mixture-of-Expert LLMs (e.g., Mixtral, Deepseek-V2 and V3)
-- Embedding Models (e.g., E5-Mistral)
-- Multi-modal LLMs (e.g., LLaVA)
+### `main`
 
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
+Pristine snapshot of `vllm-main` plus this README. Baseline for every
+feature branch.
 
-## Getting Started
+### `feat/swiglu-blockptr`
 
-Install vLLM with `pip` or [from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source):
+First kernel. Adds `_swiglustep_and_mul_kernel_blockptr` /
+`swiglustep_and_mul_triton_blockptr` alongside the original raw-pointer
+kernel, with full equivalence tests and a head-to-head benchmark.
+
+See `PLAN-swiglu-blockptr.md` on that branch for the full spec.
+
+Local results (RTX 5090, Triton 3.6.0, CUDA 12.8):
+
+- **Equivalence:** 47/47 `torch.equal` bitwise, across
+  fp16 / bf16 / fp32 × five shapes × three clamp limits
+- **Performance (bf16, limit=7.0, 7 alternating rounds):**
+
+  | (B, d) | raw median | blk median | speedup |
+  | --- | --- | --- | --- |
+  | (128, 4096) | 5.63 µs | 5.63 µs | 1.000× |
+  | (512, 4096) | 10.27 µs | 10.30 µs | 0.997× |
+  | (4096, 4096) | 75.82 µs | 75.30 µs | 1.007× |
+  | (4096, 14336) | 241.12 µs | 241.09 µs | 1.000× |
+
+  Speedup range [0.997×, 1.007×] — within measurement noise, no
+  regression.
+
+## Reproducing locally
+
+Requires a CUDA GPU, a vLLM source checkout, and the `vllm` conda env
+with `torch`, `triton`, `pytest`. Instructions below assume the source
+tree has compiled artifacts available somewhere (either built in place
+or reused from an installed wheel, see "Environment notes" below).
+
+### Equivalence tests
 
 ```bash
-pip install vllm
+conda activate vllm
+cd <worktree>
+python -m pytest \
+    tests/kernels/core/test_swiglu_blockptr_equivalence.py \
+    -v --noconftest
 ```
 
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
+Expected: `47 passed`.
 
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+### Benchmark
 
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+```bash
+conda activate vllm
+cd <worktree>
+PYTHONPATH=$(pwd) python benchmarks/kernels/benchmark_swiglu_blockptr.py
 ```
 
-## Contact Us
+The script prints GPU / driver / Triton provenance, then one row per
+benchmarked shape with raw vs. block-pointer median latency and a
+speedup column.
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+## Environment notes
 
-## Media Kit
+The `feat/swiglu-blockptr` branch includes a local-dev-only workaround
+in `vllm/platforms/cuda.py` that wraps `import vllm._C_stable_libtorch`
+in `try/except ModuleNotFoundError`. This is committed as a separate
+commit (`chore(local-dev): tolerate missing vllm._C_stable_libtorch`)
+and must be reverted before any upstream submission.
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+If you are reusing compiled artifacts from an installed wheel older
+than the current source tree, you may also need to symlink the shared
+objects into the source directory:
+
+```bash
+SITE=$(python -c 'import vllm, os; print(os.path.dirname(vllm.__file__))' \
+       2>/dev/null)
+for f in _C.abi3.so _flashmla_C.abi3.so _flashmla_extension_C.abi3.so \
+         _moe_C.abi3.so cumem_allocator.abi3.so _version.py; do
+    ln -sf "$SITE/$f" "vllm/$f"
+done
+```
+
+These symlinks are not tracked by git (they match `.gitignore`
+patterns).
+
+## Layout on each feature branch
+
+```
+PLAN-<kernel>-blockptr.md                         # spec + acceptance
+benchmarks/kernels/benchmark_<kernel>_blockptr.py # standalone bench
+tests/kernels/core/test_<kernel>_blockptr_equivalence.py
+vllm/...                                          # kernel + wrapper
+```
+
+`main` carries only this README plus the baseline source snapshot; no
+kernel changes live on `main`.
+
+## License
+
+vLLM source code is Apache-2.0 (see `LICENSE`). All files added in this
+repo carry Apache-2.0 SPDX headers.
