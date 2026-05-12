@@ -888,6 +888,135 @@ def rms_norm(
     return output.reshape(original_shape)
 
 
+# Block-pointer variant. Kept alongside the raw-pointer kernel so both can be
+# compared in the same process. Last-dim contiguity is a hard requirement;
+# the block pointer's inner stride is hard-coded to 1. The Python wrapper
+# asserts this.
+@triton.jit
+def _rms_norm_kernel_blockptr(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    input_row_stride,
+    output_row_stride,
+    n_cols,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # `make_block_ptr` requires int32 offsets; Triton uses the (int64) strides
+    # passed from Python for the actual address math. Row offset is folded
+    # into the base pointer so each block pointer is 1D — this keeps the
+    # reduction tree identical to the raw-pointer kernel (shape [BLOCK_SIZE]
+    # vs. [1, BLOCK_SIZE]), which matters for bitwise equivalence on fp32.
+    row_idx = tl.program_id(0).to(tl.int64)
+    in_row_base = input_ptr + row_idx * input_row_stride
+    out_row_base = output_ptr + row_idx * output_row_stride
+
+    in_bp = tl.make_block_ptr(
+        base=in_row_base,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+
+    # Pass 1: sum of squares in fp32. padding_option="zero" makes
+    # out-of-range columns contribute 0, matching the raw-pointer kernel's
+    # `tl.load(..., mask, other=0.0)` + `tl.where(mask, sq_vals, 0.0)`.
+    sum_sq = tl.zeros([1], dtype=tl.float32)
+    for _ in range(0, n_cols, BLOCK_SIZE):
+        vals = tl.load(in_bp, boundary_check=(0,), padding_option="zero")
+        vals_f32 = vals.to(tl.float32)
+        sq_vals = vals_f32 * vals_f32
+        sum_sq += tl.sum(sq_vals)
+        in_bp = tl.advance(in_bp, (BLOCK_SIZE,))
+
+    mean_sq = sum_sq / n_cols
+    rms = tl.sqrt(mean_sq + eps)
+    inv_rms = 1.0 / rms
+
+    # Pass 2: re-read row through a fresh 1D block pointer, scale, store.
+    in_bp2 = tl.make_block_ptr(
+        base=in_row_base,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+    out_bp = tl.make_block_ptr(
+        base=out_row_base,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+    w_bp = tl.make_block_ptr(
+        base=weight_ptr,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+
+    for _ in range(0, n_cols, BLOCK_SIZE):
+        vals = tl.load(in_bp2, boundary_check=(0,), padding_option="zero")
+        weight = tl.load(w_bp, boundary_check=(0,), padding_option="zero")
+        vals_f32 = vals.to(tl.float32)
+        weight_f32 = weight.to(tl.float32)
+        output_f32 = vals_f32 * inv_rms * weight_f32
+        output = output_f32.to(vals.dtype)
+        tl.store(out_bp, output, boundary_check=(0,))
+        in_bp2 = tl.advance(in_bp2, (BLOCK_SIZE,))
+        w_bp = tl.advance(w_bp, (BLOCK_SIZE,))
+        out_bp = tl.advance(out_bp, (BLOCK_SIZE,))
+
+
+def rms_norm_blockptr(
+    input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """
+    Block-pointer variant of `rms_norm`. Same signature and semantics;
+    differs only in address generation inside the Triton kernel.
+    """
+    assert weight.dim() == 1, "Weight must be 1-dimensional"
+    assert input.shape[-1] == weight.shape[0], (
+        f"Input last dimension ({input.shape[-1]}) must match "
+        f"weight dimension ({weight.shape[0]})"
+    )
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1])
+    input_2d = input_2d.contiguous()
+    weight = weight.contiguous()
+
+    assert input_2d.stride(-1) == 1, (
+        "rms_norm_blockptr requires input last-dim stride == 1"
+    )
+    assert weight.stride(-1) == 1, (
+        "rms_norm_blockptr requires weight last-dim stride == 1"
+    )
+
+    n_rows, n_cols = input_2d.shape
+    output = torch.empty_like(input_2d)
+    BLOCK_SIZE = 1024
+    grid = (n_rows,)
+    _rms_norm_kernel_blockptr[grid](
+        input_2d,
+        weight,
+        output,
+        input_2d.stride(0),
+        output.stride(0),
+        n_cols,
+        eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return output.reshape(original_shape)
+
+
 def rms_norm_batch_invariant(
     input: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6
 ) -> torch.Tensor:
