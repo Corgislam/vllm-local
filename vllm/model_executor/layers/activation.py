@@ -74,6 +74,101 @@ def swiglustep_and_mul_triton(
     )
 
 
+# Block-pointer variant of `_swiglustep_and_mul_kernel`.
+#
+# Numerically equivalent to the raw-pointer kernel above: same FP op sequence,
+# same dtype transitions, same grid. Only the address generation differs: this
+# kernel uses `tl.make_block_ptr` + `boundary_check` instead of manual pointer
+# arithmetic with mask. Column-axis bounds are checked via `boundary_check=(1,)`;
+# the row axis is always in-bounds because the grid is sized to `B` rows.
+#
+# Last-dim contiguity of both `input` and `output` is a hard requirement; the
+# block pointer's inner stride is hard-coded to 1. The Python wrapper asserts
+# this.
+@triton.jit
+def _swiglustep_and_mul_kernel_blockptr(
+    o_ptr,
+    o_stride,
+    x_ptr,
+    x_stride,
+    B,
+    limit: tl.constexpr,
+    d: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    # `make_block_ptr` requires int32 offsets; Triton uses the (int64) strides
+    # passed from Python for the actual address math, so row index `i` staying
+    # int32 is safe for any realistic B.
+    i = tl.program_id(axis=0)
+    j = tl.program_id(axis=1)
+    col_off = j * BLOCK_SIZE
+
+    gate_bp = tl.make_block_ptr(
+        base=x_ptr,
+        shape=(B, 2 * d),
+        strides=(x_stride, 1),
+        offsets=(i, col_off),
+        block_shape=(1, BLOCK_SIZE),
+        order=(1, 0),
+    )
+    up_bp = tl.make_block_ptr(
+        base=x_ptr,
+        shape=(B, 2 * d),
+        strides=(x_stride, 1),
+        offsets=(i, d + col_off),
+        block_shape=(1, BLOCK_SIZE),
+        order=(1, 0),
+    )
+    out_bp = tl.make_block_ptr(
+        base=o_ptr,
+        shape=(B, d),
+        strides=(o_stride, 1),
+        offsets=(i, col_off),
+        block_shape=(1, BLOCK_SIZE),
+        order=(1, 0),
+    )
+
+    gate = tl.load(gate_bp, boundary_check=(1,)).to(tl.float32)
+    up = tl.load(up_bp, boundary_check=(1,)).to(tl.float32)
+
+    gate_silu = tl.sigmoid(gate) * gate
+    gate_clamped = tl.minimum(gate_silu, limit)
+    up_clamped = tl.minimum(tl.maximum(up, -limit), limit)
+
+    result = gate_clamped * up_clamped
+    result = result.to(x_ptr.dtype.element_ty)
+    tl.store(out_bp, result, boundary_check=(1,))
+
+
+def swiglustep_and_mul_triton_blockptr(
+    output: torch.Tensor, input: torch.Tensor, limit: float = 7.0
+):
+    b, n = input.shape
+    assert input.ndim == 2
+    assert n % 2 == 0
+    assert input.stride(-1) == 1, (
+        "swiglustep_and_mul_triton_blockptr requires input.stride(-1) == 1"
+    )
+    assert output.stride(-1) == 1, (
+        "swiglustep_and_mul_triton_blockptr requires output.stride(-1) == 1"
+    )
+    d = n // 2
+
+    def grid(meta):
+        return (b, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    _swiglustep_and_mul_kernel_blockptr[grid](
+        output,
+        output.stride(0),
+        input,
+        input.stride(0),
+        b,
+        limit=limit,
+        d=d,
+        BLOCK_SIZE=1024,
+    )
+
+
 # --8<-- [start:fatrelu_and_mul]
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
