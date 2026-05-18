@@ -413,6 +413,93 @@ def _log_softmax_kernel(
         tl.store(output_row_start_ptr + col_idx, output, mask=mask)
 
 
+# Block-pointer variant. Kept alongside the raw-pointer kernel so both can be
+# compared in the same process. Last-dim contiguity is a hard requirement;
+# the block pointer's inner stride is hard-coded to 1. The Python wrapper
+# asserts this.
+@triton.jit
+def _log_softmax_kernel_blockptr(
+    input_ptr,
+    output_ptr,
+    input_row_stride,
+    output_row_stride,
+    n_cols,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Row offset is folded into the base pointer so each block pointer is 1D.
+    # This keeps the reduction shape [BLOCK_SIZE], matching the raw-pointer
+    # kernel and avoiding a [1, BLOCK_SIZE] reduction tree.
+    row_idx = tl.program_id(0).to(tl.int64)
+    row_start_ptr = input_ptr + row_idx * input_row_stride
+    output_row_start_ptr = output_ptr + row_idx * output_row_stride
+
+    in_bp = tl.make_block_ptr(
+        base=row_start_ptr,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+
+    # Pass 1: max. boundary_check padding cannot express -inf, so keep the
+    # logical mask and explicitly restore the raw kernel's other=-inf behavior.
+    max_val = -float("inf")
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(in_bp, boundary_check=(0,), padding_option="zero")
+        vals = tl.where(mask, vals, -float("inf"))
+        max_val = tl.max(tl.maximum(vals, max_val))
+        in_bp = tl.advance(in_bp, (BLOCK_SIZE,))
+
+    # Pass 2: sum exp. Rebuild from offset 0 and keep the logical mask so
+    # padded columns do not contribute exp(0 - max_val).
+    in_bp2 = tl.make_block_ptr(
+        base=row_start_ptr,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+    sum_exp = 0.0
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
+        mask = col_idx < n_cols
+        vals = tl.load(in_bp2, boundary_check=(0,), padding_option="zero")
+        exp_vals = tl.exp(vals - max_val)
+        sum_exp += tl.sum(tl.where(mask, exp_vals, 0.0))
+        in_bp2 = tl.advance(in_bp2, (BLOCK_SIZE,))
+
+    log_sum_exp = tl.log(sum_exp)
+
+    # Pass 3: re-read row through fresh input/output block pointers and store.
+    in_bp3 = tl.make_block_ptr(
+        base=row_start_ptr,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+    out_bp = tl.make_block_ptr(
+        base=output_row_start_ptr,
+        shape=(n_cols,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(BLOCK_SIZE,),
+        order=(0,),
+    )
+    for _ in range(0, n_cols, BLOCK_SIZE):
+        vals = tl.load(in_bp3, boundary_check=(0,), padding_option="zero")
+        output = vals - max_val - log_sum_exp
+        output = output.to(input_ptr.dtype.element_ty)
+        tl.store(out_bp, output, boundary_check=(0,))
+        in_bp3 = tl.advance(in_bp3, (BLOCK_SIZE,))
+        out_bp = tl.advance(out_bp, (BLOCK_SIZE,))
+
+
 def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """
     Compute log_softmax using Triton kernel.
@@ -454,6 +541,44 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
         BLOCK_SIZE=BLOCK_SIZE,
     )
     # Reshape output back to original shape
+    return output.reshape(original_shape)
+
+
+def log_softmax_blockptr(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Block-pointer variant of `log_softmax`. Same signature and semantics;
+    differs only in address generation inside the Triton kernel.
+    """
+    if dim != -1 and dim != input.ndim - 1:
+        raise ValueError(
+            "This implementation only supports log_softmax along the last dimension"
+        )
+
+    original_shape = input.shape
+    input_2d = input.reshape(-1, input.shape[-1])
+    input_2d = input_2d.contiguous()
+
+    assert input_2d.stride(-1) == 1, (
+        "log_softmax_blockptr requires input last-dim stride == 1"
+    )
+
+    n_rows, n_cols = input_2d.shape
+    output = torch.empty_like(input_2d)
+
+    assert output.stride(-1) == 1, (
+        "log_softmax_blockptr requires output last-dim stride == 1"
+    )
+
+    BLOCK_SIZE = 1024
+    grid = (n_rows,)
+    _log_softmax_kernel_blockptr[grid](
+        input_2d,
+        output,
+        input_2d.stride(0),
+        output.stride(0),
+        n_cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
     return output.reshape(original_shape)
 
 
