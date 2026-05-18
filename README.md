@@ -31,7 +31,7 @@ Local bench and validation work for the five kernels listed in the RFC:
 | 1 | SwiGLU-Step (`_swiglustep_and_mul_kernel`) | `vllm/model_executor/layers/activation.py` | done on `feat/swiglu-blockptr` |
 | 2 | Ranks (`_ranks_kernel`) | `vllm/v1/worker/gpu/sample/logprob.py` | pending |
 | 3 | RMSNorm (`_rms_norm_kernel`) | `vllm/model_executor/layers/batch_invariant.py` | pending |
-| 4 | Log-softmax (`_topk_log_softmax_kernel`) | `vllm/v1/worker/gpu/sample/logprob.py` | pending |
+| 4 | Log-softmax (`_log_softmax_kernel`) | `vllm/model_executor/layers/batch_invariant.py` | done on `feat/logsoftmax-blockptr` |
 | 5 | MRoPE (`_triton_mrope_forward`) | `vllm/model_executor/layers/rotary_embedding/mrope.py` | pending |
 
 Each conversion lives on its own branch (`feat/<kernel>-blockptr`) with
@@ -72,6 +72,15 @@ Local results (RTX 5090, Triton 3.6.0, CUDA 12.8):
   Speedup range [0.997×, 1.007×] — within measurement noise, no
   regression.
 
+### `feat/logsoftmax-blockptr`
+
+Adds `_log_softmax_kernel_blockptr` / `log_softmax_blockptr` alongside
+the original raw-pointer `_log_softmax_kernel` in
+`vllm/model_executor/layers/batch_invariant.py`, with full equivalence
+tests and a head-to-head benchmark.
+
+See `PLAN-logsoftmax-blockptr.md` on that branch for the full spec.
+
 ## Reproducing locally
 
 Requires a CUDA GPU, a vLLM source checkout, and the `vllm` conda env
@@ -80,6 +89,8 @@ tree has compiled artifacts available somewhere (either built in place
 or reused from an installed wheel, see "Environment notes" below).
 
 ### Equivalence tests
+
+**SwiGLU:**
 
 ```bash
 conda activate vllm
@@ -91,7 +102,19 @@ python -m pytest \
 
 Expected: `47 passed`.
 
+**Log-softmax:**
+
+```bash
+conda activate vllm
+cd <worktree>
+python -m pytest \
+    tests/kernels/core/test_logsoftmax_blockptr_equivalence.py \
+    -v --noconftest
+```
+
 ### Benchmark
+
+**SwiGLU:**
 
 ```bash
 conda activate vllm
@@ -99,17 +122,24 @@ cd <worktree>
 PYTHONPATH=$(pwd) python benchmarks/kernels/benchmark_swiglu_blockptr.py
 ```
 
-The script prints GPU / driver / Triton provenance, then one row per
+**Log-softmax:**
+
+```bash
+conda activate vllm
+cd <worktree>
+PYTHONPATH=$(pwd) python benchmarks/kernels/benchmark_logsoftmax_blockptr.py
+```
+
+Each script prints GPU / driver / Triton provenance, then one row per
 benchmarked shape with raw vs. block-pointer median latency and a
 speedup column.
 
 ## Environment notes
 
-The `feat/swiglu-blockptr` branch includes a local-dev-only workaround
-in `vllm/platforms/cuda.py` that wraps `import vllm._C_stable_libtorch`
-in `try/except ModuleNotFoundError`. This is committed as a separate
-commit (`chore(local-dev): tolerate missing vllm._C_stable_libtorch`)
-and must be reverted before any upstream submission.
+Each feature branch includes a local-dev-only workaround in
+`vllm/platforms/cuda.py` that wraps `import vllm._C_stable_libtorch`
+in `try/except ModuleNotFoundError`. This must be reverted before any
+upstream submission.
 
 If you are reusing compiled artifacts from an installed wheel older
 than the current source tree, you may also need to symlink the shared
